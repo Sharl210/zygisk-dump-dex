@@ -1,17 +1,26 @@
+ 
 #![feature(naked_functions)]
 
-use dobby_rs::Address;
-use jni::JNIEnv;
-use log::{error, info, trace};
-use nix::{fcntl::OFlag, sys::stat::Mode};
-// use std::arch::asm;
-use std::arch::naked_asm;
 use std::{
-    fs::File,
+    ffi::c_void,
+    fs::{self, File},
     io::Read,
     os::fd::{AsRawFd, FromRawFd},
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
 };
+
+use dobby_rs::Address;
+use jni::{objects::JObject, JNIEnv, JavaVM};
+use lazy_static::lazy_static;
+use log::{error, info, trace};
+use nix::{fcntl::OFlag, sys::stat::Mode};
 use zygisk_rs::{register_zygisk_module, Api, AppSpecializeArgs, Module, ServerSpecializeArgs};
+
+static APPLICATION_SAVED: AtomicBool = AtomicBool::new(false);
+lazy_static! {
+    static ref JAVA_VM: *mut jni_sys::JavaVM = ptr::null_mut();
+}
 
 struct MyModule {
     api: Api,
@@ -23,80 +32,48 @@ impl Module for MyModule {
         android_logger::init_once(
             android_logger::Config::default()
                 .with_max_level(log::LevelFilter::Info)
-                .with_tag("dump_dex"),
+                .with_tag("DexDumper"),
         );
+        
         let env = unsafe { JNIEnv::from_raw(env.cast()).unwrap() };
+        unsafe {
+            let _ = env.get_java_vm().map(|vm| {
+                *JAVA_VM = vm as _;
+            });
+        }
+        
         Self { api, env }
     }
+
     fn pre_app_specialize(&mut self, args: &mut AppSpecializeArgs) {
-        let mut inner = || -> anyhow::Result<()> {
-            let package_name = self
-                .env
-                .get_string(unsafe {
-                    (args.nice_name as *mut jni_sys::jstring as *mut ()
-                        as *const jni::objects::JString<'_>)
-                        .as_ref()
-                        .unwrap()
-                })?
-                .to_string_lossy()
-                .to_string();
-            trace!("pre_app_specialize: package_name: {}", package_name);
-            let module_dir = self
-                .api
-                .get_module_dir()
-                .ok_or_else(|| anyhow::anyhow!("get_module_dir error"))?;
-            let mut list_file = unsafe {
-                File::from_raw_fd(nix::fcntl::openat(
-                    Some(module_dir.as_raw_fd()),
-                    "list.txt",
-                    OFlag::O_CLOEXEC,
-                    Mode::empty(),
-                )?)
-            };
-            let mut file_content = String::new();
-            list_file.read_to_string(&mut file_content)?;
-
-            let find: bool = file_content
-                .split("\n")
-                .any(|item| item.trim() == package_name);
-
-            if !find {
-                self.api
-                    .set_option(zygisk_rs::ModuleOption::DlcloseModuleLibrary);
-                return Ok(());
+        let package = match self.extract_package_name(args) {
+            Ok(name) => name,
+            Err(e) => {
+                error!("获取包名失败: {:?}", e);
+                return;
             }
-            info!("dump {}", package_name);
-            let open_common = dobby_rs::resolve_symbol("libdexfile.so", "_ZN3art13DexFileLoader10OpenCommonENSt3__110shared_ptrINS_16DexFileContainerEEEPKhmRKNS1_12basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEENS1_8optionalIjEEPKNS_10OatDexFileEbbPSC_PNS_22DexFileLoaderErrorCodeE")
-                .ok_or_else(|| anyhow::anyhow!("resolve symbol error"))?;
-            info!("open_common addr: {:x}", open_common as usize);
-            unsafe {
-                OLD_OPEN_COMMON =
-                    dobby_rs::hook(open_common, new_open_common_wrapper as Address)? as usize
-            };
-
-            Ok(())
         };
-        if let Err(e) = inner() {
-            error!("pre_app_specialize error: {:?}", e);
+        
+        if !self.check_package_in_list(&package) {
+            self.api.set_option(zygisk_rs::ModuleOption::DlcloseModuleLibrary);
+            return;
+        }
+
+        if let Err(e) = self.setup_hooks() {
+            error!("初始化Hook失败: {:?}", e);
         }
     }
-
-    fn post_app_specialize(&mut self, _args: &AppSpecializeArgs) {}
-
-    fn pre_server_specialize(&mut self, _args: &mut ServerSpecializeArgs) {}
-
-    fn post_server_specialize(&mut self, _args: &ServerSpecializeArgs) {}
 }
 
 register_zygisk_module!(MyModule);
+
 static mut OLD_OPEN_COMMON: usize = 0;
 
 #[naked]
 pub extern "C" fn new_open_common_wrapper() {
     unsafe {
         naked_asm!(
-            r#"
-            sub sp, sp, 0x280
+            "sub sp, sp, 0x280
             stp x29, x30, [sp, #0]
             stp x0, x1, [sp, #0x10]
             stp x2, x3, [sp, #0x20]
@@ -106,7 +83,7 @@ pub extern "C" fn new_open_common_wrapper() {
 
             mov x0, x1
             mov x1, x2
-            bl {new_open_common}
+            bl {}
 
             ldp x29, x30, [sp, #0]
             ldp x0, x1, [sp, #0x10]
@@ -115,48 +92,120 @@ pub extern "C" fn new_open_common_wrapper() {
             ldp x6, x7, [sp, #0x40]
             ldp x8, x9, [sp, #0x50]
             add sp, sp, 0x280
-            adrp x16, {old_open_common}
+            adrp x16, {}
             ldr x16, [x16, #:lo12:{old_open_common}]
-            br x16"#,
-            new_open_common = sym new_open_common,
+            br x16",
+            sym new_open_common,
             old_open_common = sym OLD_OPEN_COMMON,
-            // options(noreturn)
         );
     }
 }
 
 extern "C" fn new_open_common(base: usize, size: usize) {
-    info!("find dex: base=0x{:x}, size=0x{:x}", base, size);
-
-    let dex_data = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
-    let package = match std::fs::read_to_string("/proc/self/cmdline") {
-        Ok(cmdline) => cmdline,
+    let package = match get_process_name() {
+        Ok(name) => name,
         Err(e) => {
-            error!("read cmdline error: {:?}", e);
+            error!("获取进程名失败: {:?}", e);
             return;
         }
     };
-    if package.is_empty() {
-        error!("package name is empty");
-        return;
+
+    if let Err(e) = save_dex(base, size, &package) {
+        error!("DEX保存失败: {:?}", e);
     }
-    let Some(package) = package.split('\0').next() else {
-        error!("package name split by zero error: {}", package);
-        return;
-    };
-
-    let dir = format!("/data/data/{}/dexes", package);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        error!("create dir error: {:?}", e);
-        return;
-    }
-
-    let crc = crc::Crc::<u32>::new(&crc::CRC_32_CD_ROM_EDC);
-    let mut digest = crc.digest();
-    digest.update(dex_data);
-
-    let file_name = format!("/data/data/{}/dexes/{:08x}.dex", package, digest.finalize());
-    if let Err(e) = std::fs::write(file_name, dex_data) {
-        error!("write file error: {:?}", e);
+    
+    if !APPLICATION_SAVED.load(Ordering::Relaxed) {
+        if let Err(e) = save_application_info(&package) {
+            error!("应用信息保存失败: {:?}", e);
+        }
+        APPLICATION_SAVED.store(true, Ordering::Relaxed);
     }
 }
+
+fn save_dex(base: usize, size: usize, package: &str) -> anyhow::Result<()> {
+    let dex_data = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
+    let dir = format!("/data/data/{}/dexes", package);
+    fs::create_dir_all(&dir)?;
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(dex_data);
+    let file_name = format!("{}/{:08x}.dex", dir, hasher.finalize());
+    fs::write(file_name, dex_data)?;
+    Ok(())
+}
+
+fn save_application_info(package: &str) -> anyhow::Result<()> {
+    let env = unsafe { get_jni_env()? };
+    let class_name = get_application_class(&env)?;
+    
+    let path = format!("/data/data/{}/dexes/Application.txt", package);
+    fs::write(path, class_name)?;
+    Ok(())
+}
+
+unsafe fn get_jni_env() -> anyhow::Result<JNIEnv<'static>> {
+    let mut env = ptr::null_mut();
+    let status = (**JAVA_VM).GetEnv(JAVA_VM, &mut env, jni_sys::JNI_VERSION_1_6);
+    
+    if status == jni_sys::JNI_OK {
+        Ok(JNIEnv::from_raw(env.cast())?)
+    } else {
+        let status = (**JAVA_VM).AttachCurrentThread(JAVA_VM, &mut env, ptr::null_mut());
+        if status == jni_sys::JNI_OK {
+            Ok(JNIEnv::from_raw(env.cast())?)
+        } else {
+            Err(anyhow::anyhow!("JNI环境初始化失败"))
+        }
+    }
+}
+
+fn get_application_class(env: &JNIEnv) -> anyhow::Result<String> {
+    let activity_thread = env.find_class("android/app/ActivityThread")?;
+    let current_thread = env.call_static_method(
+        activity_thread,
+        "currentActivityThread",
+        "()Landroid/app/ActivityThread;",
+        &[],
+    )?.l()?;
+
+    let app_bind_data: JObject = env.get_field(current_thread, "mBoundApplication", "Landroid/app/ActivityThread$AppBindData;")?.l()?;
+    let app_info: JObject = env.get_field(app_bind_data, "appInfo", "Landroid/content/pm/ApplicationInfo;")?.l()?;
+    let class_name: JObject = env.get_field(app_info, "className", "Ljava/lang/String;")?.l()?;
+
+    Ok(env.get_string(class_name.into())?.to_string_lossy().into_owned())
+}
+
+impl MyModule {
+    fn extract_package_name(&self, args: &AppSpecializeArgs) -> anyhow::Result<String> {
+        let jstr = unsafe { (args.nice_name as *mut jni_sys::jstring).as_ref().unwrap() };
+        Ok(self.env.get_string(jstr)?.to_string_lossy().into_owned())
+    }
+
+    fn check_package_in_list(&self, package: &str) -> bool {
+        let Ok(mut file) = File::open("list.txt") else { return false };
+        let mut content = String::new();
+        file.read_to_string(&mut content).unwrap_or(0) > 0 && 
+        content.lines().any(|line| line.trim() == package)
+    }
+
+    fn setup_hooks(&self) -> anyhow::Result<()> {
+        let symbol = "_ZN3art13DexFileLoader10OpenCommonEPKhmRKNSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEEjbbPS9_PNS_22DexFileLoaderErrorCodeE";
+        
+        let address = dobby_rs::resolve_symbol("libdexfile.so", symbol)
+            .ok_or_else(|| anyhow::anyhow!("符号解析失败"))?;
+
+        unsafe {
+            OLD_OPEN_COMMON = dobby_rs::hook(address, new_open_common_wrapper as Address)? as usize;
+        }
+        Ok(())
+    }
+}
+
+fn get_process_name() -> anyhow::Result<String> {
+    let mut cmdline = fs::read_to_string("/proc/self/cmdline")?;
+    if let Some(pos) = cmdline.find('\0') {
+        cmdline.truncate(pos);
+    }
+    Ok(cmdline)
+}
+ 
